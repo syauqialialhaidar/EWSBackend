@@ -88,7 +88,7 @@ class ScriptFix:
 
     def GenerateSentiment(self, text_content):
         if not text_content:
-            return {'sentiment': 'NEUTRAL', 'confidence': 1.0, 'source': 'empty_text'}
+            return {'sentiment': 'Timeout', 'confidence': 1.0, 'source': 'empty_text'}
             
         url = "https://generate-sentiment-naive-baiyes.onlinemonitoring.id/sentiment/generate"
         headers = {

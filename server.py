@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pymongo import MongoClient
 from sshtunnel import SSHTunnelForwarder
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta, date, time # <-- TAMBAHAN IMPORT
+from datetime import datetime, timedelta, date, time
 import pytz
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -11,9 +11,9 @@ import os
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="EWS Statistics API")
+app = FastAPI(title="EWS Statistics API - Multi-Platform Ready")
 
-# KONFIGURASI CORS BARU
+# KONFIGURASI CORS
 origins = [
     "http://localhost",
     "http://localhost:5173",
@@ -28,37 +28,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SSH_CONFIG = {
-    "SSH_HOST": os.getenv("SSH_HOST"),
-    "SSH_PORT": int(os.getenv("SSH_PORT", 22)),
-    "SSH_USER": os.getenv("SSH_USER"),
-    "SSH_PASSWORD": os.getenv("SSH_PASSWORD"),
-    "DB_HOST": os.getenv("DB_HOST"),
+DB_CONFIG = {
+    "DB_HOST": os.getenv("DB_HOST", "localhost"),
     "DB_PORT": int(os.getenv("DB_PORT", 27017)),
-    "TARGET_DB": os.getenv("TARGET_DB")
+    "TARGET_DB": os.getenv("TARGET_DB", "ews")
 }
 
-def get_db_connection():
-    try:
-        server = SSHTunnelForwarder(
-            (SSH_CONFIG["SSH_HOST"], SSH_CONFIG["SSH_PORT"]),
-            ssh_username=SSH_CONFIG["SSH_USER"],
-            ssh_password=SSH_CONFIG["SSH_PASSWORD"],
-            remote_bind_address=(SSH_CONFIG["DB_HOST"], SSH_CONFIG["DB_PORT"])
-        )
-        server.start()
-        
-        client = MongoClient(f'mongodb://{SSH_CONFIG["DB_HOST"]}:{server.local_bind_port}/')
-        db = client[SSH_CONFIG["TARGET_DB"]]
-        return db, server
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
-
-# --- DEFINISI GLOBAL ---
+# --- DEFINISI GLOBAL & HELPER ---
 WATCH_LIST_COLLECTION = "watch_list"
 COLLECTION_NAME = "rapidapi_alexander"
 STATUS_MAP = {0: "Normal", 1: "Early", 2: "Emerging", 3: "Current", 4: "Crisis"}
+JAKARTA_TZ = pytz.timezone('Asia/Jakarta')
 
+def get_db_connection():
+    """Membuat koneksi langsung ke MongoDB lokal."""
+    try:
+        uri = f'mongodb://{DB_CONFIG["DB_HOST"]}:{DB_CONFIG["DB_PORT"]}/'
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client.admin.command('ping') 
+        db = client[DB_CONFIG["TARGET_DB"]]
+        return db, None 
+    except Exception as e:
+        error_msg = f"Database connection error: Failed to connect to {DB_CONFIG['DB_HOST']}:{DB_CONFIG['DB_PORT']} - {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+def get_canonical_id_pipeline(field_name: str = "_id"):
+    """Mengembalikan pipeline agregasi untuk membuat ID kanonik dari 3 field ID."""
+    return {
+        "$addFields": {
+            field_name: {
+                "$ifNull": [
+                    "$tweet_id", {"$ifNull": ["$post_id", "$id_video"]}
+                ]
+            }
+        }
+    }
+
+def get_engagement_score_pipeline():
+    """Mengembalikan pipeline untuk menghitung skor engagement total yang fleksibel."""
+    # Mencakup semua field engagement dari Twitter, IG, dan TikTok
+    return {
+        "$addFields": {
+            "total_engagement_score": {
+                "$sum": [
+                    {"$ifNull": ["$favorites", 0]},  # Twitter
+                    {"$ifNull": ["$replies", 0]},    # Twitter
+                    {"$ifNull": ["$retweets", 0]},   # Twitter
+                    {"$ifNull": ["$likes", 0]},      # Instagram
+                    {"$ifNull": ["$comments", 0]},   # Instagram/TikTok
+                    {"$ifNull": ["$reposts", 0]},    # Instagram
+                    {"$ifNull": ["$share", 0]},      # Instagram/TikTok
+                    {"$ifNull": ["$views", 0]},      # TikTok
+                    {"$ifNull": ["$digg", 0]},       # TikTok (Like)
+                    {"$ifNull": ["$coments", 0]},    # TikTok (Comment - field typo di scrapper)
+                    {"$ifNull": ["$engagement", 0]}, # Fallback/field lain
+                ]
+            }
+        }
+    }
+
+
+def format_post_output(post: Dict[str, Any], status_map: Dict[int, str]) -> Dict[str, Any]:
+    """Format post untuk output, mendukung semua platform."""
+    numeric_status = post.get("latest_status_value", 0)
+    latest_status = status_map.get(numeric_status, "N/A")
+    created_at_ts = post.get("created_at")
+    
+    # Konversi timestamp ke ISO format di zona waktu Jakarta
+    created_at_dt = datetime.fromtimestamp(created_at_ts, tz=pytz.utc).astimezone(JAKARTA_TZ) if isinstance(created_at_ts, (int, float)) else None
+    
+    # Tentukan platform dan URL
+    post_id = post.get("tweet_id") or post.get("post_id") or post.get("id_video")
+    platform = post.get("platform", "twitter") # Asumsi default twitter jika tidak ada
+    
+    url = "N/A"
+    if platform == 'instagram' and post_id:
+        url = f"https://www.instagram.com/p/{post_id}/"
+    elif platform == 'tiktok' and post_id:
+        url = f"https://www.tiktok.com/video/{post_id}" # Format umum TikTok
+    elif post_id:
+        url = f"https://twitter.com/user/status/{post_id}"
+
+    # Mengambil info user dan follower yang fleksibel
+    user_info = post.get("user_info", {})
+    
+    # Logika fleksibel untuk follower count
+    followers = user_info.get("followers_count") or post.get("followerCount") or 0 # TikTok menggunakan 'followerCount' langsung di dokumen
+    following = user_info.get("friends_count") or post.get("followingCount") or 0
+    
+    # Logika fleksibel untuk text content
+    text_content = post.get("text") or post.get("captions") or post.get("capstion") # Twitter, IG, TikTok (typo)
+    
+    # Detail Engagement Spesifik (Untuk Debug/Detail)
+    specific_metrics = {
+        "twitter": {"retweets": post.get("retweets"), "favorites": post.get("favorites"), "replies": post.get("replies")},
+        "instagram": {"likes": post.get("likes"), "comments": post.get("comments"), "reposts": post.get("reposts"), "shares": post.get("share")},
+        "tiktok": {"views": post.get("views"), "likes": post.get("like"), "comments": post.get("coments"), "shares": post.get("share")},
+    }
+    
+    return {
+        "post_id": post_id, 
+        "platform": platform,
+        "text_content": text_content, 
+        "engagement": post.get("total_engagement_score", post.get("engagement")), # Gunakan total_engagement_score jika ada
+        "created_at": created_at_dt.isoformat() if created_at_dt else None, 
+        "latest_status": latest_status, 
+        "topik": post.get("topik"),
+        "url": url,
+        "metrics_detail": specific_metrics,
+        "user": {
+            "name": user_info.get("name") or post.get("nickname"), 
+            "screen_name": user_info.get("screen_name") or post.get("username"), 
+            "profile_image_url": user_info.get("avatar") or post.get("foto_profil") or post.get("profil"),
+            "followers_count": followers, 
+            "following_count": following
+        }
+    }
+
+# --- ENDPOINTS YANG DIMODIFIKASI ---
 
 @app.get("/sentiment-distribution")
 async def get_sentiment_distribution(
@@ -66,84 +154,312 @@ async def get_sentiment_distribution(
     end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
 ):
     """
-    Get sentiment distribution (from watch_list) AND total unique posts (from rapidapi_alexander).
+    Get sentiment distribution dan total unique posts.
+    MENGGUNAKAN ID KANONIK.
     """
     db, server = get_db_connection()
     try:
-        # ==================================================================
-        # BAGIAN 1: LOGIKA SENTIMEN (TIDAK BERUBAH)
-        # Mengambil data dari 'watch_list' berdasarkan 'timestamp_publikasi'
-        # ==================================================================
-        match_filter_sentiment = {"status": {"$exists": True}}
+        match_filter = {}
         if start_date and end_date:
             start_dt = datetime.combine(start_date, time.min)
             end_dt = datetime.combine(end_date, time.max)
-            match_filter_sentiment["timestamp_publikasi"] = {
-                "$gte": int(start_dt.timestamp()), 
-                "$lte": int(end_dt.timestamp())
+            match_filter["created_at"] = {
+                "$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())
             }
-            
+        match_filter["sentiment"] = {"$in": ["Positive", "Negative", "Neutral"]}
+
         pipeline_sentiment = [
-            {"$match": match_filter_sentiment},
-            {"$unwind": "$status"},
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+            {"$match": match_filter},
+            # 1. Tambahkan ID Kanonik
+            get_canonical_id_pipeline("canonical_id"),
+            # 2. Kelompokkan berdasarkan ID Kanonik untuk mendapatkan post unik (ambil sentimen terakhir)
+            {"$group": {"_id": "$canonical_id", "sentiment": {"$last": "$sentiment"}}},
+            # 3. Kelompokkan lagi berdasarkan sentimen, dan hitung jumlahnya
+            {"$group": {"_id": "$sentiment", "count": {"$sum": 1}}}
         ]
-        
-        result_sentiment = list(db.watch_list.aggregate(pipeline_sentiment))
+        result_sentiment = list(db.rapidapi_alexander.aggregate(pipeline_sentiment))
         sentiment_distribution = {"positive": 0, "negative": 0, "neutral": 0}
-        
+
         for item in result_sentiment:
-            status = int(item["_id"])
-            count = item["count"]
-            if status >= 3: sentiment_distribution["negative"] += count
-            elif status == 0: sentiment_distribution["neutral"] += count
-            else: sentiment_distribution["positive"] += count
-        
-        # ==================================================================
-        # BAGIAN 2: LOGIKA TOTAL UNIQUE POSTS (BARU)
-        # Mengambil data dari 'rapidapi_alexander' berdasarkan 'created_at'
-        # ==================================================================
-        pipeline_total = []
-        match_filter_total = {}
-        if start_date and end_date:
-            start_dt_total = datetime.combine(start_date, time.min)
-            end_dt_total = datetime.combine(end_date, time.max)
-            # Perhatikan: ini menggunakan 'created_at' sesuai logika /total-unique-posts
-            match_filter_total["created_at"] = {
-                "$gte": int(start_dt_total.timestamp()), 
-                "$lte": int(end_dt_total.timestamp())
-            }
-            pipeline_total.append({"$match": match_filter_total})
-        
-        pipeline_total.extend([
-            {"$group": {"_id": "$tweet_id"}},
-            {"$count": "total_unique_tweets"}
-        ])
+            sentiment_label = item["_id"].lower()
+            if sentiment_label in sentiment_distribution:
+                sentiment_distribution[sentiment_label] = item["count"]
 
-        result_cursor_total = list(db.rapidapi_alexander.aggregate(pipeline_total))
-        
-        total_unique = 0
-        if result_cursor_total:
-            total_unique = result_cursor_total[0].get("total_unique_tweets", 0)
-
-        # ==================================================================
-        # BAGIAN 3: RETURN (DIUBAH)
-        # ==================================================================
-        return {
-            "sentiment_distribution": sentiment_distribution,
-            # Menggunakan total_unique, BUKAN sum(sentiment_distribution.values())
-            "total_posts": total_unique 
-        }
+        total_unique = sum(sentiment_distribution.values())
+        return {"sentiment_distribution": sentiment_distribution, "total_posts": total_unique}
     finally:
-        server.close()
+        if server: server.close()
 
+@app.get("/total-unique-posts")
+async def get_total_unique_posts(
+    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
+):
+    """
+    Get the total count of UNIQUE posts scraped, MENGGUNAKAN ID KANONIK.
+    """
+    db, server = get_db_connection()
+    try:
+        pipeline = []
+        match_filter = {}
+        if start_date and end_date:
+            start_dt = datetime.combine(start_date, time.min)
+            end_dt = datetime.combine(end_date, time.max)
+            match_filter["created_at"] = {
+                "$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())
+            }
+            pipeline.append({"$match": match_filter})
+        
+        # 1. Tambahkan ID Kanonik (canonical_id)
+        pipeline.append(get_canonical_id_pipeline("canonical_id"))
+        
+        # 2. Grouping berdasarkan ID Kanonik (semua post unik)
+        pipeline.append({"$group": {"_id": "$canonical_id"}})
+        
+        # 3. Hitung jumlah kelompok
+        pipeline.append({"$count": "total_unique_posts"})
+
+        result_cursor = list(db.rapidapi_alexander.aggregate(pipeline))
+        total = result_cursor[0].get("total_unique_posts", 0) if result_cursor else 0
+        return {"total_unique_posts": total}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+    finally:
+        if server: server.close()
+
+@app.get("/top-topics")
+async def get_top_topics(
+    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
+):
+    """
+    Get top 3 topics (based on unique post count) and their top posts, 
+    MENGGUNAKAN ID KANONIK.
+    """
+    db, server = get_db_connection()
+    try:
+        match_filter_main = {}
+        match_filter_watchlist = {}
+        if start_date and end_date:
+            start_dt = datetime.combine(start_date, time.min)
+            end_dt = datetime.combine(end_date, time.max)
+            start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
+            match_filter_main["created_at"] = {"$gte": start_ts, "$lte": end_ts}
+            match_filter_watchlist["timestamp_publikasi"] = {"$gte": start_ts, "$lte": end_ts}
+
+        pipeline_top_topics = []
+        if match_filter_main: pipeline_top_topics.append({"$match": match_filter_main})
+        
+        # 1. Tambahkan ID Kanonik
+        pipeline_top_topics.append(get_canonical_id_pipeline("canonical_id"))
+
+        pipeline_top_topics.extend([
+            # 2. Kelompokkan berdasarkan topik DAN ID kanonik untuk mendapatkan post unik per topik
+            {"$group": {
+                "_id": {"topik": "$topik", "canonical_id": "$canonical_id"}
+            }},
+            # 3. Kelompokkan LAGI hanya berdasarkan topik, lalu hitung jumlah uniknya
+            {"$group": {
+                "_id": "$_id.topik",  
+                "count": {"$sum": 1} 
+            }},
+            # 4. Urutkan dan ambil 3 teratas
+            {"$sort": {"count": -1}},
+            {"$limit": 3}
+        ])
+        
+        top_topics = list(db.rapidapi_alexander.aggregate(pipeline_top_topics))
+        results = []
+        for topic in top_topics:
+            topic_keyword = topic["_id"]
+            
+            # 1. Ambil 10 Post Teratas dari Watch List (Masih Fleksibel karena Watch List fleksibel)
+            pipeline_top_posts = [{"$match": {"topik": topic_keyword}}]
+            if match_filter_watchlist: pipeline_top_posts.append({"$match": match_filter_watchlist})
+            
+            pipeline_top_posts.extend([
+                # Mendapatkan ID kanonik dari watch_list
+                {"$addFields": {"canonical_id": {"$ifNull": ["$tweet_id", {"$ifNull":["$post_id","$id_video"]}]}}},
+                {"$addFields": {"latest_status_value": {"$arrayElemAt": ["$status", -1]}}},
+                {"$match": {"latest_status_value": {"$ne": 0}}},
+                {"$sort": {"timestamp_publikasi": -1}},
+                {"$limit": 10},
+                {"$project": {"canonical_id": 1, "latest_status_value": 1, "_id": 0}}
+            ])
+            top_10_posts_summary = list(db.watch_list.aggregate(pipeline_top_posts))
+
+            top_posts_details = []
+            for summary in top_10_posts_summary:
+                canonical_id = summary.get("canonical_id")
+                # 2. Cari detail post di rapidapi_alexander menggunakan ID kanonik
+                post_match_filter = {
+                    "$or": [
+                        {"tweet_id": canonical_id},
+                        {"post_id": canonical_id},
+                        {"id_video": canonical_id}
+                    ]
+                }
+                # Ambil versi terakhir post (engagement tertinggi/terbaru)
+                post = list(db.rapidapi_alexander.aggregate([
+                    {"$match": post_match_filter},
+                    get_engagement_score_pipeline(), # Hitung skor engagement
+                    {"$sort": {"total_engagement_score": -1}}, # Sort berdasarkan engagement
+                    {"$limit": 1}
+                ]))
+                
+                if post:
+                    # Format menggunakan fungsi yang fleksibel
+                    formatted_post = format_post_output({
+                        **post[0], 
+                        "latest_status_value": summary.get("latest_status_value")
+                    }, STATUS_MAP)
+                    top_posts_details.append(formatted_post)
+                    
+            results.append({"topic": topic_keyword, "total_posts": topic["count"], "top_10_posts": top_posts_details})
+        return {"top_topics": results}
+    finally:
+        if server: server.close()
+
+
+@app.get("/posts-by-engagement")
+async def get_posts_by_engagement(
+    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=200), skip: int = Query(0, ge=0)
+):
+    """Get posts sorted by highest engagement, with pagination and date filter. MENGGUNAKAN TOTAL ENGAGEMENT SKOR FLEKSIBEL."""
+    db, server = get_db_connection()
+    try:
+        match_filter = {}
+        if start_date and end_date:
+            start_dt = datetime.combine(start_date, time.min)
+            end_dt = datetime.combine(end_date, time.max)
+            match_filter["created_at"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
+        
+        pipeline = []
+        if match_filter: pipeline.append({"$match": match_filter})
+        
+        pipeline.extend([
+            # 1. Hitung total engagement score (fleksibel)
+            get_engagement_score_pipeline(), 
+            # 2. Tambahkan canonical_id
+            get_canonical_id_pipeline("canonical_id"),
+            # 3. Urutkan berdasarkan engagement score
+            {"$sort": {"total_engagement_score": -1}},
+            # 4. Grup berdasarkan ID kanonik untuk mendapatkan versi terbaik/terbaru
+            {"$group": {"_id": "$canonical_id", "doc": {"$first": "$$ROOT"}}},
+            {"$replaceRoot": {"newRoot": "$doc"}},
+            {"$sort": {"total_engagement_score": -1}},
+            # 5. Lookup ke watch_list menggunakan ID kanonik
+            {"$lookup": {
+                "from": WATCH_LIST_COLLECTION,
+                "let": {"cid": "$canonical_id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$or": [
+                        {"$eq": ["$tweet_id", "$$cid"]},
+                        {"$eq": ["$post_id", "$$cid"]},
+                        {"$eq": ["$id_video", "$$cid"]}
+                    ]}}}
+                ],
+                "as": "status_info"
+            }},
+            {"$unwind": {"path": "$status_info", "preserveNullAndEmptyArrays": True}},
+            {"$skip": skip}, {"$limit": limit},
+            # 6. Proyeksi
+            {"$project": {
+                "tweet_id": 1, "post_id": 1, "id_video": 1, "platform": 1, "text": 1, "captions": 1, "capstion": 1,
+                "engagement": "$total_engagement_score", "created_at": 1, "topik": 1,
+                "retweets": 1, "favorites": 1, "replies": 1, "likes": 1, "comments": 1, "reposts": 1, "share": 1,
+                "views": 1, "digg": 1, "coments": 1,
+                "latest_status_value": {"$arrayElemAt": ["$status_info.status", -1]},
+                "user_info": 1, "followerCount": 1, "followingCount": 1, "username": 1, "nickname": 1, "profil": 1, "foto_profil": 1
+            }}
+        ])
+        
+        post_list = list(db[COLLECTION_NAME].aggregate(pipeline, allowDiskUse=True))
+        # Format menggunakan fungsi fleksibel
+        formatted_posts = [format_post_output(post, STATUS_MAP) for post in post_list]
+        return {"posts_by_engagement": formatted_posts}
+    finally:
+        if server: server.close()
+
+@app.get("/posts-by-followers")
+async def get_posts_by_followers(
+    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=200), skip: int = Query(0, ge=0)
+):
+    """Get posts from unique users sorted by followers, MENGGUNAKAN FIELD FOLLOWERS FLEKSIBEL."""
+    db, server = get_db_connection()
+    try:
+        match_filter = {}
+        if start_date and end_date:
+            start_dt = datetime.combine(start_date, time.min)
+            end_dt = datetime.combine(end_date, time.max)
+            match_filter["created_at"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
+            
+        pipeline = []
+        if match_filter: pipeline.append({"$match": match_filter})
+        
+        # Tambahkan field followers/username kanonik
+        pipeline.extend([
+            {"$addFields": {
+                "canonical_username": {"$ifNull": ["$user_info.screen_name", "$username"]},
+                "canonical_followers_count": {"$ifNull": ["$user_info.followers_count", "$followerCount"]} # Prioritas: Twitter/IG field, lalu TikTok field
+            }},
+            # 1. Grup untuk mendapatkan versi post terakhir/terbaik (engagement) per ID post kanonik
+            get_canonical_id_pipeline("canonical_id"),
+            {"$group": {"_id": "$canonical_id", "doc": {"$last": "$$ROOT"}}},
+            {"$replaceRoot": {"newRoot": "$doc"}},
+            # 2. Urutkan berdasarkan followers kanonik, lalu ambil post terbaik per user kanonik
+            {"$sort": {"canonical_followers_count": -1}},
+            {"$group": {"_id": "$canonical_username", "best_post_per_user": {"$first": "$$ROOT"}}},
+            {"$replaceRoot": {"newRoot": "$best_post_per_user"}},
+            # 3. Urutkan lagi berdasarkan followers kanonik global
+            {"$sort": {"canonical_followers_count": -1}},
+            # 4. Lookup ke watch_list menggunakan ID kanonik
+            {"$lookup": {
+                "from": WATCH_LIST_COLLECTION,
+                "let": {"cid": "$canonical_id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$or": [
+                        {"$eq": ["$tweet_id", "$$cid"]},
+                        {"$eq": ["$post_id", "$$cid"]},
+                        {"$eq": ["$id_video", "$$cid"]}
+                    ]}}}
+                ],
+                "as": "status_info"
+            }},
+            {"$unwind": {"path": "$status_info", "preserveNullAndEmptyArrays": True}},
+            {"$skip": skip}, {"$limit": limit},
+            # 5. Proyeksi
+            {"$project": {
+                "tweet_id": 1, "post_id": 1, "id_video": 1, "platform": 1, "text": 1, "captions": 1, "capstion": 1,
+                "engagement": 1, "created_at": 1, "topik": 1,
+                "retweets": 1, "favorites": 1, "replies": 1, "likes": 1, "comments": 1, "reposts": 1, "share": 1,
+                "views": 1, "digg": 1, "coments": 1,
+                "latest_status_value": {"$arrayElemAt": ["$status_info.status", -1]},
+                "user_info": 1, "followerCount": 1, "followingCount": 1, "username": 1, "nickname": 1, "profil": 1, "foto_profil": 1
+            }}
+        ])
+        
+        post_list = list(db[COLLECTION_NAME].aggregate(pipeline, allowDiskUse=True))
+        # Format menggunakan fungsi fleksibel
+        formatted_posts = [format_post_output(post, STATUS_MAP) for post in post_list]
+        return {"posts_by_followers": formatted_posts}
+    finally:
+        if server: server.close()
+
+
+# --- ENDPOINTS YANG SUDAH ADA (MINOR CHECK) ---
 
 @app.get("/viral-posts")
 async def get_viral_posts(
     start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
 ):
-    """Get viral posts statistics with an optional date filter."""
+    """Get viral posts statistics with an optional date filter. Menggunakan watch_list (sudah fleksibel di sisi crawler)."""
     db, server = get_db_connection()
     STATUS_VIRAL = [1, 2, 3, 4]
     STATUS_MAP_REVERSE = {4: "crisis", 3: "current", 2: "emerging", 1: "early", 0: "normal"}
@@ -155,8 +471,7 @@ async def get_viral_posts(
             match_filter["timestamp_publikasi"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
         
         pipeline = []
-        if match_filter:
-            pipeline.append({"$match": match_filter})
+        if match_filter: pipeline.append({"$match": match_filter})
 
         pipeline.extend([
             {"$addFields": {"latest_status": {"$arrayElemAt": ["$status", -1]}}},
@@ -177,7 +492,7 @@ async def get_viral_posts(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
     finally:
-        server.close()
+        if server: server.close()
 
 
 @app.get("/status-distribution")
@@ -185,7 +500,7 @@ async def get_status_distribution(
     start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
 ):
-    """Get total posts by status with an optional date filter."""
+    """Get total posts by status with an optional date filter. Menggunakan watch_list."""
     db, server = get_db_connection()
     try:
         match_filter = {}
@@ -195,8 +510,7 @@ async def get_status_distribution(
             match_filter["timestamp_publikasi"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
 
         pipeline = []
-        if match_filter:
-            pipeline.append({"$match": match_filter})
+        if match_filter: pipeline.append({"$match": match_filter})
             
         pipeline.extend([
             {"$unwind": "$status"},
@@ -213,173 +527,15 @@ async def get_status_distribution(
             ]
         }
     finally:
-        server.close()
-   
-# ... (kode server.py Anda yang lain) ...
-
-@app.get("/top-topics")
-async def get_top_topics(
-    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
-):
-    """
-    Get top 3 topics (based on unique tweet count) and their top posts, 
-    with an optional date filter.
-    """
-    db, server = get_db_connection()
-    try:
-        match_filter_main = {}
-        match_filter_watchlist = {}
-        if start_date and end_date:
-            start_dt = datetime.combine(start_date, time.min)
-            end_dt = datetime.combine(end_date, time.max)
-            start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
-            match_filter_main["created_at"] = {"$gte": start_ts, "$lte": end_ts}
-            match_filter_watchlist["timestamp_publikasi"] = {"$gte": start_ts, "$lte": end_ts}
-
-        pipeline_top_topics = []
-        if match_filter_main:
-            pipeline_top_topics.append({"$match": match_filter_main})
-        
-        # ======================================================
-        # INI ADALAH BAGIAN YANG DIUBAH
-        # ======================================================
-        # Logika diubah untuk menghitung tweet_id unik per topik
-        pipeline_top_topics.extend([
-            # 1. Kelompokkan berdasarkan topik DAN tweet_id untuk mendapatkan unik
-            {"$group": {
-                "_id": {
-                    "topik": "$topik",
-                    "tweet_id": "$tweet_id"
-                }
-            }},
-            # 2. Kelompokkan LAGI hanya berdasarkan topik, lalu hitung jumlah uniknya
-            {"$group": {
-                "_id": "$_id.topik",  # _id sekarang adalah nama topiknya
-                "count": {"$sum": 1}   # Menghitung jumlah tweet_id unik
-            }},
-            # 3. Urutkan berdasarkan hitungan unik
-            {"$sort": {"count": -1}},
-            # 4. Ambil 3 teratas
-            {"$limit": 3}
-        ])
-        # ======================================================
-        # AKHIR DARI BAGIAN YANG DIUBAH
-        # ======================================================
-        
-        top_topics = list(db.rapidapi_alexander.aggregate(pipeline_top_topics))
-        
-        results = []
-        for topic in top_topics:
-            # Sisa dari fungsi ini tidak perlu diubah
-            topic_keyword = topic["_id"]
-            
-            pipeline_top_posts = [{"$match": {"topik": topic_keyword}}]
-            if match_filter_watchlist:
-                pipeline_top_posts.append({"$match": match_filter_watchlist})
-            pipeline_top_posts.extend([
-                {"$addFields": {"latest_status_value": {"$arrayElemAt": ["$status", -1]}}},
-                {"$match": {"latest_status_value": {"$ne": 0}}},
-                {"$sort": {"timestamp_publikasi": -1}},
-                {"$limit": 10},
-                {"$project": {"tweet_id": 1, "latest_status_value": 1, "_id": 0}}
-            ])
-            top_10_posts_summary = list(db.watch_list.aggregate(pipeline_top_posts))
-
-            top_posts_details = []
-            for summary in top_10_posts_summary:
-                post = db.rapidapi_alexander.find_one({"tweet_id": summary.get("tweet_id")})
-                if post:
-                    user_info = post.get("user_info", {})
-                    top_posts_details.append({
-                        "tweet_id": post.get("tweet_id"),
-                        "latest_status": STATUS_MAP.get(summary.get("latest_status_value", 0), "Normal"),
-                        "text": post.get("text"), "engagement": post.get("engagement"),
-                        "created_at": datetime.fromtimestamp(post.get("created_at")),
-                        "retweet_count": post.get("retweets"), "favorite_count": post.get("favorites"),
-                        "reply_count": post.get("replies"), "url": f"https://twitter.com/user/status/{post.get('tweet_id')}",
-                        "user": {"name": user_info.get("name"), "screen_name": user_info.get("screen_name"),
-                                 "profile_image_url": user_info.get("avatar"), "followers_count": user_info.get("followers_count"),
-                                 "following_count": user_info.get("friends_count")}
-                    })
-            results.append({"topic": topic_keyword, "total_posts": topic["count"], "top_10_posts": top_posts_details})
-        return {"top_topics": results}
-    finally:
-        server.close()
-
-# ... (sisa kode server.py Anda) ...
-
-# --- UNMODIFIED ENDPOINT ---
-
-@app.get("/topic-status/{topic}")
-async def get_topic_status(topic: str, id_project: Optional[str] = Query(None, description="tier / id_project to select threshold")):
-    """Get status distribution and engagement trends for a specific topic."""
-    db, server = get_db_connection()
-    try:
-        resolved_tier = id_project
-        if not resolved_tier:
-            wl_doc = db.watch_list.find_one({"topik": topic}, projection={"id_project": 1})
-            if wl_doc and wl_doc.get("id_project"): resolved_tier = wl_doc.get("id_project")
-            else:
-                ra_doc = db.rapidapi_alexander.find_one({"topik": topic}, projection={"id_project": 1})
-                if ra_doc and ra_doc.get("id_project"): resolved_tier = ra_doc.get("id_project")
-
-        threshold_doc = db.threshold.find_one({"tier": resolved_tier}) if resolved_tier else db.threshold.find_one({})
-        if not threshold_doc: raise HTTPException(status_code=404, detail="Threshold (tier) not found")
-
-        def normalize_threshold(doc):
-            if not doc: return None
-            if all(k in doc for k in ("early", "emerging", "current", "crisis")): return {k: doc[k] for k in ("early", "emerging", "current", "crisis")}
-            if "threshold" in doc and isinstance(doc["threshold"], list):
-                m = {}; [m.update(item) for item in doc["threshold"] if isinstance(item, dict)]; return {k: m.get(k) for k in ("early", "emerging", "current", "crisis")}
-            return {k: doc.get(k) for k in ("early", "emerging", "current", "crisis")}
-
-        thresh = normalize_threshold(threshold_doc)
-        if not thresh or any(v is None for v in thresh.values()): raise HTTPException(status_code=500, detail="Invalid threshold format in DB")
-
-        pipeline = [
-            {"$match": {"topik": topic}}, {"$sort": {"refresh_id": 1}},
-            {"$group": {"_id": "$tweet_id", "engagements": {"$push": "$engagement"}, "timestamps": {"$push": "$refresh_id"}}}
-        ]
-        tweets = list(db.rapidapi_alexander.aggregate(pipeline))
-        results = []
-        total_current, total_prev = 0, 0
-        for t in tweets:
-            engs = t.get("engagements", [])
-            if len(engs) < 2: continue
-            prev, curr = engs[-2] or 0, engs[-1] or 0
-            total_prev += prev; total_current += curr
-            growth_percent = ((curr - prev) / (prev + 1)) * 100
-            status_label = "Normal"
-            if growth_percent > thresh["crisis"]: status_label = "Crisis"
-            elif growth_percent > thresh["current"]: status_label = "Current"
-            elif growth_percent > thresh["emerging"]: status_label = "Emerging"
-            elif growth_percent > thresh["early"]: status_label = "Early"
-            results.append({"tweet_id": t["_id"], "previous_engagement": prev, "current_engagement": curr, "growth_percentage": round(growth_percent, 2), "status": status_label})
-
-        status_distribution = {}
-        for r in results: status_distribution[r["status"]] = status_distribution.get(r["status"], 0) + 1
-        
-        topic_growth = ((total_current - total_prev) / (total_prev + 1)) * 100
-        topic_status = "Normal"
-        if topic_growth > thresh["crisis"]: topic_status = "Crisis"
-        elif topic_growth > thresh["current"]: topic_status = "Current"
-        elif topic_growth > thresh["emerging"]: topic_status = "Emerging"
-        elif topic_growth > thresh["early"]: topic_status = "Early"
-
-        return {"topic": topic, "resolved_id_project": resolved_tier, "threshold_used": thresh, "topic_status": topic_status, "topic_growth_percentage": round(topic_growth, 2), "status_distribution": status_distribution, "tweet_details": results}
-    finally:
-        server.close()
-
-# --- MODIFIED ENDPOINTS (CONTINUED) ---
-
+        if server: server.close()
+    
 @app.get("/analysis-summary")
 async def get_analysis_summary(
     topic: str = Query("all"),
     start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
 ):
-    """Get the count of posts for each status for a topic, with an optional date filter."""
+    """Get the count of posts for each status for a topic, with an optional date filter. Menggunakan watch_list."""
     db, server = get_db_connection()
     try:
         match_filter = {}
@@ -402,10 +558,9 @@ async def get_analysis_summary(
             if status_key: summary_data[status_key] = item["count"]
         return summary_data
     finally:
-        server.close()
+        if server: server.close()
         
 
-# GANTI FUNGSI LAMA ANDA DENGAN YANG INI
 @app.get("/topic-trend-analysis")
 async def get_topic_trend_analysis(
     topic: str = Query("all"),
@@ -413,19 +568,15 @@ async def get_topic_trend_analysis(
     end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
 ):
     """
-    Get topic trend data.
-    - Groups by day for date ranges > 1 day.
-    - Groups by hour for a single day range.
+    Get topic trend data (post counts by status) grouped by day or hour. Menggunakan watch_list.
     """
     db, server = get_db_connection()
     try:
         match_filter = {}
-        if topic != "all":
-            match_filter["topik"] = topic
+        if topic != "all": match_filter["topik"] = topic
 
-        # Validasi dan set default jika tanggal tidak ada
         if not start_date or not end_date:
-            today = datetime.now(pytz.timezone('Asia/Jakarta')).date()
+            today = datetime.now(JAKARTA_TZ).date()
             start_date = end_date = today
 
         start_dt = datetime.combine(start_date, time.min)
@@ -442,11 +593,7 @@ async def get_topic_trend_analysis(
             }},
         ]
 
-        # ======================================================
-        # INI ADALAH LOGIKA UTAMA (IF/ELSE)
-        # ======================================================
         if start_date == end_date:
-            # KASUS 1: Rentang 1 hari -> Agregasi per JAM
             group_stage = {
                 "$group": {
                     "_id": {
@@ -454,7 +601,7 @@ async def get_topic_trend_analysis(
                             "$dateToString": {
                                 "format": "%H:00", 
                                 "date": {"$toDate": {"$multiply": ["$timestamp_publikasi", 1000]}},
-                                "timezone": "Asia/Jakarta" # <-- Cara timezone yang lebih baik
+                                "timezone": "Asia/Jakarta"
                             }
                         },
                         "status": "$latest_status_value"
@@ -466,13 +613,12 @@ async def get_topic_trend_analysis(
             reshape_key_name = "hour"
 
         else:
-            # KASUS 2: Rentang > 1 hari -> Agregasi per HARI
             group_stage = {
                 "$group": {
                     "_id": {
                         "day": {
                             "$dateToString": {
-                                "format": "%d-%m-%Y", # Format tanggal bisa diubah sesuai selera
+                                "format": "%d-%m-%Y", 
                                 "date": {"$toDate": {"$multiply": ["$timestamp_publikasi", 1000]}},
                                 "timezone": "Asia/Jakarta"
                             }
@@ -489,13 +635,9 @@ async def get_topic_trend_analysis(
                 current_date += timedelta(days=1)
             reshape_key_name = "day"
 
-        # Gabungkan pipeline dan jalankan agregasi
         full_pipeline = pipeline_base + [group_stage]
         results = list(db.watch_list.aggregate(full_pipeline))
 
-        # --- Proses Reshaping Data untuk Chart.js ---
-        # (STATUS_MAP sudah ada di global, kita gunakan itu)
-        
         data_points = {label: {cat: 0 for cat in STATUS_MAP.values()} for label in labels}
 
         for item in results:
@@ -506,209 +648,36 @@ async def get_topic_trend_analysis(
 
         datasets = []
         for status_name in STATUS_MAP.values():
-            dataset = {
+            datasets.append({
                 "label": status_name,
                 "data": [data_points[label][status_name] for label in labels]
-            }
-            datasets.append(dataset)
+            })
 
         return {"labels": labels, "datasets": datasets}
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
     finally:
-        server.close()
+        if server: server.close()
         
-def format_post_output(post: Dict[str, Any], status_map: Dict[int, str]) -> Dict[str, Any]:
-    numeric_status = post.get("latest_status_value", 0)
-    latest_status = status_map.get(numeric_status, "N/A")
-    created_at_ts = post.get("created_at")
-    created_at_iso = datetime.fromtimestamp(created_at_ts, tz=pytz.utc).isoformat() if isinstance(created_at_ts, (int, float)) else None
-    user_info = post.get("user_info", {})
-    return {
-        "tweet_id": post.get("tweet_id"), "text": post.get("text"), "engagement": post.get("engagement"),
-        "created_at": created_at_iso, "latest_status": latest_status, "topik": post.get("topik"),
-        "retweet_count": post.get("retweets"), "favorite_count": post.get("favorites"), "reply_count": post.get("replies"),
-        "url": f"https://twitter.com/user/status/{post.get('tweet_id')}",
-        "user": {"name": user_info.get("name"), "screen_name": user_info.get("screen_name"), "profile_image_url": user_info.get("avatar"),
-                 "followers_count": user_info.get("followers_count"), "following_count": user_info.get("friends_count")}
-    }
-
-@app.get("/posts-by-engagement")
-async def get_posts_by_engagement(
-    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)"),
-    limit: int = Query(100, ge=1, le=200), skip: int = Query(0, ge=0)
-):
-    """Get posts sorted by highest engagement, with pagination and date filter."""
-    db, server = get_db_connection()
-    try:
-        match_filter = {}
-        if start_date and end_date:
-            start_dt = datetime.combine(start_date, time.min)
-            end_dt = datetime.combine(end_date, time.max)
-            match_filter["created_at"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
-        
-        pipeline = []
-        if match_filter:
-            pipeline.append({"$match": match_filter})
-        
-        pipeline.extend([
-            {"$addFields": {"total_engagement_score": {"$sum": ["$favorites", "$replies", "$retweets"]}}},
-            {"$sort": {"total_engagement_score": -1}},
-            {"$group": {"_id": "$tweet_id", "doc": {"$first": "$$ROOT"}}},
-            {"$replaceRoot": {"newRoot": "$doc"}},
-            {"$sort": {"total_engagement_score": -1}},
-            {"$lookup": {"from": WATCH_LIST_COLLECTION, "localField": "tweet_id", "foreignField": "tweet_id", "as": "status_info"}},
-            {"$unwind": {"path": "$status_info", "preserveNullAndEmptyArrays": True}},
-            {"$skip": skip}, {"$limit": limit},
-            {"$project": {"tweet_id": 1, "text": 1, "engagement": "$total_engagement_score", "created_at": 1, "topik": 1,
-                          "retweets": 1, "favorites": 1, "replies": 1, "latest_status_value": {"$arrayElemAt": ["$status_info.status", -1]},
-                          "user_info": 1}}
-        ])
-        
-        post_list = list(db[COLLECTION_NAME].aggregate(pipeline, allowDiskUse=True))
-        formatted_posts = [format_post_output(post, STATUS_MAP) for post in post_list]
-        return {"posts_by_engagement": formatted_posts}
-    finally:
-        server.close()
-
-@app.get("/posts-by-followers")
-async def get_posts_by_followers(
-    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)"),
-    limit: int = Query(100, ge=1, le=200), skip: int = Query(0, ge=0)
-):
-    """Get posts from unique users sorted by followers, with pagination and date filter."""
-    db, server = get_db_connection()
-    try:
-        match_filter = {}
-        if start_date and end_date:
-            start_dt = datetime.combine(start_date, time.min)
-            end_dt = datetime.combine(end_date, time.max)
-            match_filter["created_at"] = {"$gte": int(start_dt.timestamp()), "$lte": int(end_dt.timestamp())}
-            
-        pipeline = []
-        if match_filter:
-            pipeline.append({"$match": match_filter})
-        
-        pipeline.extend([
-            {"$group": {"_id": "$tweet_id", "doc": {"$last": "$$ROOT"}}},
-            {"$replaceRoot": {"newRoot": "$doc"}},
-            {"$sort": {"user_info.followers_count": -1}},
-            {"$group": {"_id": "$user_info.screen_name", "best_post_per_user": {"$first": "$$ROOT"}}},
-            {"$replaceRoot": {"newRoot": "$best_post_per_user"}},
-            {"$sort": {"user_info.followers_count": -1}},
-            {"$lookup": {"from": WATCH_LIST_COLLECTION, "localField": "tweet_id", "foreignField": "tweet_id", "as": "status_info"}},
-            {"$unwind": {"path": "$status_info", "preserveNullAndEmptyArrays": True}},
-            {"$skip": skip}, {"$limit": limit},
-            {"$project": {"tweet_id": 1, "text": 1, "engagement": 1, "created_at": 1, "topik": 1,
-                          "retweets": 1, "favorites": 1, "replies": 1, "latest_status_value": {"$arrayElemAt": ["$status_info.status", -1]},
-                          "user_info": 1}}
-        ])
-        
-        post_list = list(db[COLLECTION_NAME].aggregate(pipeline, allowDiskUse=True))
-        formatted_posts = [format_post_output(post, STATUS_MAP) for post in post_list]
-        return {"posts_by_followers": formatted_posts}
-    finally:
-        server.close()
-
-
-
-
-# DATA ENDPOINTS BARU
-
-
-
-@app.get("/total-unique-posts")
-async def get_total_unique_posts(
-    start_date: Optional[date] = Query(None, description="Tanggal mulai (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(None, description="Tanggal akhir (YYYY-MM-DD)")
-):
-    """
-    Get the total count of UNIQUE posts scraped, with an optional date filter.
-    Counts distinct tweet_ids from the raw scrape log.
-    """
-    db, server = get_db_connection()
-    try:
-        pipeline = []
-        
-        # 1. Filter Tanggal (Opsional)
-        #    Ini akan memfilter berdasarkan KAPAN tweet itu di-posting (created_at)
-        match_filter = {}
-        if start_date and end_date:
-            start_dt = datetime.combine(start_date, time.min)
-            end_dt = datetime.combine(end_date, time.max)
-            # Menggunakan 'created_at' dari koleksi rapidapi_alexander
-            match_filter["created_at"] = {
-                "$gte": int(start_dt.timestamp()), 
-                "$lte": int(end_dt.timestamp())
-            }
-            pipeline.append({"$match": match_filter})
-        
-        # 2. Logika Inti: Menghitung Tweet Unik
-        #    Tahap 1: Kelompokkan semua tweet berdasarkan "tweet_id"
-        pipeline.append({
-            "$group": {
-                "_id": "$tweet_id"
-            }
-        })
-        
-        #    Tahap 2: Hitung jumlah kelompok yang terbentuk
-        pipeline.append({
-            "$count": "total_unique_tweets"
-        })
-
-        # 3. Jalankan Agregasi
-        result_cursor = list(db.rapidapi_alexander.aggregate(pipeline))
-        
-        # 4. Format Hasil
-        if not result_cursor:
-            # Jika tidak ada data sama sekali
-            return {"total_unique_posts": 0}
-            
-        total = result_cursor[0].get("total_unique_tweets", 0)
-        return {"total_unique_posts": total}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
-    finally:
-        server.close()
-
 
 @app.get("/all-unique-topics")
 async def get_all_unique_topics():
-    """
-    Mengambil daftar semua topik unik (keyword) beserta id_project-nya dari koleksi rapidapi_alexander.
-    """
+    """Mengambil daftar semua topik unik (keyword) beserta id_project-nya dari koleksi rapidapi_alexander."""
     db, server = get_db_connection()
     try:
         pipeline = []
-        
-        # Tambahkan filter id_project jika disediakan
-        # if id_project:
-        #      pipeline.append({"$match": {"id_project": id_project}})
-        
-        # Pipeline Agregasi:
         pipeline.extend([
-            # 1. Grouping berdasarkan kombinasi topik dan id_project
-            #    Ini memastikan setiap baris output adalah kombinasi unik dari topik dan id_project
             {"$group": {"_id": {"topik": "$topik", "id_project": "$id_project"}}},
-            
-            # 2. Proyeksi untuk merapikan output
             {"$project": {
                 "_id": 0,
                 "topik": "$_id.topik",
                 "id_project": "$_id.id_project"
             }},
-            
-            # 3. Pengurutan untuk keterbacaan
             {"$sort": {"topik": 1, "id_project": 1}}
         ])
 
         results = list(db.rapidapi_alexander.aggregate(pipeline))
-        
-        # Filter nilai topik yang None (jika ada)
         unique_topics_with_project = [
             item for item in results 
             if item.get("topik") is not None
@@ -719,27 +688,19 @@ async def get_all_unique_topics():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching unique topics: {str(e)}")
     finally:
-        if server:
-            server.close()
+        if server: server.close()
 
 
 @app.get("/threshold/{id_project}")
 async def get_threshold_by_id(id_project: str):
-    """
-    Mengambil data threshold dari koleksi 'threshold' berdasarkan id_project (tier).
-    """
+    """Mengambil data threshold dari koleksi 'threshold' berdasarkan id_project (tier)."""
     db, server = get_db_connection()
     try:
-        # Panggil fungsi getThreshold dari mongo.py
-        # Menggunakan db.threshold.find_one
         threshold_doc = db.threshold.find_one({"tier": id_project})
         
         if not threshold_doc:
-            # Jika tidak ditemukan, kembalikan data default atau kosong
-            # Frontend akan menginisialisasi grid dengan nilai kosong jika ini terjadi.
             return {"tier": id_project, "threshold": []} 
         
-        # Hapus _id dari hasil sebelum dikirim
         if "_id" in threshold_doc:
             del threshold_doc["_id"]
             
@@ -748,7 +709,7 @@ async def get_threshold_by_id(id_project: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching threshold: {str(e)}")
     finally:
-        server.close()
+        if server: server.close()
 
 
 if __name__ == "__main__":
