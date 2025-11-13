@@ -1,6 +1,6 @@
 import pymongo
-client = pymongo.MongoClient("localhost", 27017)
-db = client.ews
+client = pymongo.MongoClient("localhost", 27018)
+db = client.ewsnew
 
 
 # --------------------------------------------------------

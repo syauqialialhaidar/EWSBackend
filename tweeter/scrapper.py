@@ -23,25 +23,33 @@ def calculateEngagement(post):
     except:
         return 0
 
-def GetKeywords(id_project = None):
-    succ = False
-    v_api = "https://api.kurasi.media/v2/crawler/get-keyword-all/medsos"
-    v_params = {
-        "source": "twitter, instagram, tiktok"
-    }
-    if id_project:
-        v_params['id_project'] = id_project
-    while not succ:
-    # get keyword list
-        try:
-            api = requests.get(v_api, params=v_params)
+def GetKeywords(id_project=273):
+    if id_project is None:
+        id_project = os.getenv("PROJECT_ID", "273")
 
-            keyword_list = api.json()
-            succ = True
-            return keyword_list
-        except:
-            print("FAILED. TRY TO REQUEST KEYWORDS AGAIN...")
+    url = f"https://api.kurasi.media/v2/crawler/get-keyword-all/medsos?id_project={id_project}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
             
+            # Pastikan format sesuai (punya field "keywords")
+            if isinstance(data, dict) and "keywords" in data:
+                print(f"[KEYWORDS] Ditemukan {len(data['keywords'])} keyword untuk project {id_project}.")
+                return {"keywords": data["keywords"]}  
+            else:
+                print("[KEYWORDS] Format respons API tidak sesuai.")
+                return {"keywords": []}
+        else:
+            print(f"[KEYWORDS] Gagal ambil keyword (Status: {response.status_code}).")
+            return {"keywords": []}
+
+    except requests.exceptions.RequestException as e:
+        print(f"[KEYWORDS] Request error: {e}")
+        return {"keywords": []}
+
+
 
 def getTimeWindow(start_timestamp, id_project):
     start_datetime = datetime.fromtimestamp(start_timestamp)
@@ -588,8 +596,7 @@ class ScriptFix:
             else:
                 keywords = GetKeywords(self.args.id_project)
                 
-            limit = int(self.args.limit) if self.args.limit else 5
-            keywords['keywords'] = [k.strip() for k in keywords['keywords']][:limit]
+            keywords['keywords'] = [k.strip() for k in keywords.get('keywords', [])]
 
             total_keywords = len(keywords['keywords'])
 

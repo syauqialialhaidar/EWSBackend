@@ -30,8 +30,8 @@ app.add_middleware(
 
 DB_CONFIG = {
     "DB_HOST": os.getenv("DB_HOST", "localhost"),
-    "DB_PORT": int(os.getenv("DB_PORT", 27017)),
-    "TARGET_DB": os.getenv("TARGET_DB", "ews")
+    "DB_PORT": int(os.getenv("DB_PORT", 27018)),
+    "TARGET_DB": os.getenv("TARGET_DB", "ewsnew")
 }
 
 # --- DEFINISI GLOBAL & HELPER ---
