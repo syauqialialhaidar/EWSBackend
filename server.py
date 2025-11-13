@@ -54,12 +54,11 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail=error_msg)
 
 def get_canonical_id_pipeline(field_name: str = "_id"):
-    """Mengembalikan pipeline agregasi untuk membuat ID kanonik dari 3 field ID."""
     return {
         "$addFields": {
             field_name: {
                 "$ifNull": [
-                    "$tweet_id", {"$ifNull": ["$post_id", "$id_video"]}
+                    "$post_id", {"$ifNull": ["$id_video", "$tweet_id"]}
                 ]
             }
         }
@@ -89,8 +88,28 @@ def get_engagement_score_pipeline():
     }
 
 
+# --- DEFINISI GLOBAL & HELPER (REVISI get_canonical_id_pipeline) ---
+# ... (kode di atas)
+
+def get_canonical_id_pipeline(field_name: str = "_id"):
+    """
+    Mengembalikan pipeline agregasi untuk membuat ID kanonik dari 3 field ID. 
+    Urutan prioritas: post_id (IG) > id_video (TikTok) > tweet_id (Twitter).
+    """
+    return {
+        "$addFields": {
+            field_name: {
+                "$ifNull": [
+                    "$post_id", {"$ifNull": ["$id_video", "$tweet_id"]}
+                ]
+            }
+        }
+    }
+
+# ... (kode get_engagement_score_pipeline)
+
 def format_post_output(post: Dict[str, Any], status_map: Dict[int, str]) -> Dict[str, Any]:
-    """Format post untuk output, mendukung semua platform."""
+    """Format post untuk output, mendukung semua platform. TANPA ASUMSI DEFAULT PLATFORM."""
     numeric_status = post.get("latest_status_value", 0)
     latest_status = status_map.get(numeric_status, "N/A")
     created_at_ts = post.get("created_at")
@@ -98,27 +117,36 @@ def format_post_output(post: Dict[str, Any], status_map: Dict[int, str]) -> Dict
     # Konversi timestamp ke ISO format di zona waktu Jakarta
     created_at_dt = datetime.fromtimestamp(created_at_ts, tz=pytz.utc).astimezone(JAKARTA_TZ) if isinstance(created_at_ts, (int, float)) else None
     
-    # Tentukan platform dan URL
+    # Tentukan platform dan ID Post Kanonik
     post_id = post.get("tweet_id") or post.get("post_id") or post.get("id_video")
-    platform = post.get("platform", "twitter") # Asumsi default twitter jika tidak ada
+    # TIDAK LAGI MENGGUNAKAN DEFAULT 'twitter'
+    platform = post.get("platform", "N/A") 
     
     url = "N/A"
+    user_info = post.get("user_info", {})
+
     if platform == 'instagram' and post_id:
         url = f"https://www.instagram.com/p/{post_id}/"
     elif platform == 'tiktok' and post_id:
-        url = f"https://www.tiktok.com/video/{post_id}" # Format umum TikTok
-    elif post_id:
+        # PENTING: Ambil username/screen_name untuk URL TikTok yang valid.
+        # Fallback 'v' digunakan karena diperlukan oleh format URL, tapi tetap lebih baik daripada default Twitter.
+        tiktok_username = user_info.get("screen_name") or post.get("username") or "v" 
+        # Coba format umum TikTok: https://www.tiktok.com/@username/video/id_video
+        url = f"https://www.tiktok.com/@{tiktok_username}/video/{post_id}"
+        if tiktok_username == 'v':
+            # Fallback format alternatif/mobile jika username tidak ditemukan
+            url = f"https://www.tiktok.com/v/{post_id}" 
+    elif platform == 'twitter' and post_id:
+        # Penanganan khusus Twitter (hanya jika platform terekam sebagai 'twitter')
         url = f"https://twitter.com/user/status/{post_id}"
-
-    # Mengambil info user dan follower yang fleksibel
-    user_info = post.get("user_info", {})
+    # Jika platform "N/A" atau post_id tidak ada, URL tetap "N/A"
     
-    # Logika fleksibel untuk follower count
-    followers = user_info.get("followers_count") or post.get("followerCount") or 0 # TikTok menggunakan 'followerCount' langsung di dokumen
+    # Mengambil info user dan follower yang fleksibel
+    followers = user_info.get("followers_count") or post.get("followerCount") or 0 
     following = user_info.get("friends_count") or post.get("followingCount") or 0
     
     # Logika fleksibel untuk text content
-    text_content = post.get("text") or post.get("captions") or post.get("capstion") # Twitter, IG, TikTok (typo)
+    text_content = post.get("text") or post.get("captions") or post.get("capstion") 
     
     # Detail Engagement Spesifik (Untuk Debug/Detail)
     specific_metrics = {
@@ -131,7 +159,7 @@ def format_post_output(post: Dict[str, Any], status_map: Dict[int, str]) -> Dict
         "post_id": post_id, 
         "platform": platform,
         "text_content": text_content, 
-        "engagement": post.get("total_engagement_score", post.get("engagement")), # Gunakan total_engagement_score jika ada
+        "engagement": post.get("total_engagement_score", post.get("engagement")),
         "created_at": created_at_dt.isoformat() if created_at_dt else None, 
         "latest_status": latest_status, 
         "topik": post.get("topik"),
