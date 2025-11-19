@@ -20,20 +20,12 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--id_project", help="ID Project")
     parser.add_argument("-a", "--api_key", help="API Key")
     parser.add_argument("-l", "--limit", help="Limit of tweet to search")
-    parser.add_argument(
-        '-s', 
-        '--sources', 
-        type=str, 
-        default="tiktok", # Nilai default
-        help='Daftar sumber media sosial yang akan dicrawl, dipisahkan koma (misal: twitter,instagram)'
-    )
-
     args = parser.parse_args()
 
     timestamp = int(time.time())
     dt = datetime.fromtimestamp(timestamp)
     #jam 5 mulai, jam 8 selesai
-    if dt.hour >= 21 or dt.hour <= 4:
+    if dt.hour >= 21 and dt.hour <= 4:
         print(f"--------Jam : {dt.hour}. SKIPPING----------")
         exit(0)
 

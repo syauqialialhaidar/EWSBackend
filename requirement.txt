@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pymongo
+sshtunnel
+python-dotenv
+pytz
+pandas
+requests

@@ -5,38 +5,27 @@ from modules.mongo import appendStatusToWatchList, getActionFrom3Status, getWatc
 from tweeter.scrapper import GetKeywords 
 
 def getPostId(tweet):
-    """
-    Menentukan ID postingan unik (tweet_id, post_id, atau id_video) dari dokumen.
-    """
     if 'tweet_id' in tweet:
         return tweet['tweet_id'], 'twitter'
     elif 'id_video' in tweet:
         return tweet['id_video'], 'tiktok'
     elif 'post_id' in tweet:
         return tweet['post_id'], 'instagram'
-    # Fallback/Error
     return None, None
 
 def formTweetUrl(post_id, platform=None):
-    """
-    Membuat URL postingan berdasarkan ID dan platform.
-    """
     if platform == 'twitter':
         return f"https://twitter.com/user/status/{post_id}"
     elif platform == 'instagram':
-        # Instagram menggunakan shortcode di path
         return f"https://www.instagram.com/p/{post_id}/"
     elif platform == 'tiktok':
-        # TikTok menggunakan video ID. (Format URL umum)
         return f"https://www.tiktok.com/@user/video/{post_id}" 
     else:
-        # Fallback ke Twitter
         return f"https://twitter.com/user/status/{post_id}" 
 
 
 def getIdfromTweetUrl(url):
     id = url.split('/')
-    # Asumsi ID selalu di index ke-5 untuk format Twitter
     return id[5]
 
 
@@ -53,8 +42,6 @@ def statusToNumber(status):
         return 4
     return -1
 
-# -----------------------------------------------------
-## 🔄 REFRESH CORE LOGIC
 
 def refresh(timestamp, id_project):
     tweets = getDataWithTimestamp(timestamp, id_project)
@@ -63,26 +50,18 @@ def refresh(timestamp, id_project):
     added = []
     
     for tweet in tweets:
-        # PERUBAHAN KUNCI 1: Mengambil ID dan Platform secara fleksibel
         post_id, platform = getPostId(tweet)
+        sentiments = tweet.get("sentiment")
         
         if post_id is None:
             print(f"[WARN] Skipping post with unknown ID format.")
             continue
 
         timestampPublikasi = tweet["created_at"]
-        
-        # PERUBAHAN KUNCI 2: Mencocokkan WatchList dengan ID yang fleksibel
-        # WatchList mungkin menyimpan ID sebagai 'tweet_id', 'post_id', atau lainnya. 
-        # Kita perlu mencari di mana pun ID itu tersimpan.
         match = [x for x in watchList if x.get("tweet_id") == post_id or x.get("post_id") == post_id or x.get("id_video") == post_id]
         
-        # NOTE: Untuk kode addToWatchList/setWatchListStatus, pastikan fungsi mongo Anda
-        # menerima ID yang sesuai dengan ID unik dokumen (post_id).
-        
         if len(match) == 0:
-            # Asumsi addToWatchList menyimpan ID sebagai 'tweet_id' (atau yang di-pass)
-            addToWatchList(post_id, tweet["topik"], timestampPublikasi, id_project)
+            addToWatchList(post_id, tweet["topik"], timestampPublikasi, id_project, platform=platform, sentiment=sentiments)
             watchList.append({"tweet_id": post_id, "is_active": True})
             print("Added: " + post_id)
             addRefreshData(tweet, timestamp, id_project)
@@ -90,14 +69,12 @@ def refresh(timestamp, id_project):
             added.append(post_id)
         else:
             item_match = match[0]
-            # Mendapatkan ID yang tersimpan di WatchList (asumsi salah satunya ada)
             current_id = item_match.get("tweet_id") or item_match.get("post_id") or item_match.get("id_video")
             
             if item_match in unwatchList:
                 unwatchList.remove(item_match)
 
             if item_match["is_active"] == False:
-                #skip
                 continue
             else:
                 if current_id not in added:
@@ -106,14 +83,13 @@ def refresh(timestamp, id_project):
                 else:
                     adder = 0
 
-                addToWatchList(current_id, tweet["topik"], timestampPublikasi, id_project, adder)
+                addToWatchList(current_id, tweet["topik"], timestampPublikasi, id_project, adder, platform=platform)
                 addRefreshData(tweet, timestamp, id_project)
                 
                 print("Refreshed: " + current_id)
             
             added.append(current_id)
             
-    # item still in watchList is "expired" that means it doesnt show up in the search anymore
     for item in unwatchList:
         item_id = item.get("tweet_id") or item.get("post_id") or item.get("id_video")
         if item_id:
@@ -133,55 +109,62 @@ def timeDiffToString(unixDiff):
         return str(unixDiff // 3600) + " Jam " + str((unixDiff % 3600) // 60) + " Menit"
     return str(unixDiff // 86400) + "Hari"
 
-## 🚀 EWS LOGIC
 
-def EWSLogic(refresh_id, id_project = None):
+def EWSLogic(refresh_id, id_project=None):
     watchListWithTimestamps = list(getActiveWatchList(id_project))
     
-    # PERUBAHAN KUNCI 3: Kumpulkan semua ID yang mungkin tersimpan di WatchList
     watchList = []
     for item in watchListWithTimestamps:
-        # Tambahkan semua ID unik yang ada di item WatchList
-        if 'tweet_id' in item: watchList.append(item['tweet_id'])
-        if 'post_id' in item: watchList.append(item['post_id'])
-        if 'id_video' in item: watchList.append(item['id_video'])
+        if 'tweet_id' in item:
+            watchList.append(item['tweet_id'])
+        if 'post_id' in item:
+            watchList.append(item['post_id'])
+        if 'id_video' in item:
+            watchList.append(item['id_video'])
 
     aggregate = [
         {
             '$match': {
-                # PERUBAHAN KUNCI 4: Match di semua field ID
                 '$or': [
                     {'tweet_id': {'$in': watchList}},
                     {'post_id': {'$in': watchList}},
                     {'id_video': {'$in': watchList}},
                 ]
             }
-        }, {
-            '$sort': {
-                'refresh_id': 1
-            }
-        }, {
+        },
+        {
+            '$sort': {'refresh_id': 1}
+        },
+        {
             '$unwind': {
                 'path': '$engagement',
                 'preserveNullAndEmptyArrays': True
             }
-        }, {
+        },
+        {
             '$group': {
-                # PERUBAHAN KUNCI 5: Grup berdasarkan ID unik mana pun yang ditemukan
                 '_id': {
                     '$ifNull': [
-                        '$tweet_id', '$post_id', '$id_video' 
+                        '$tweet_id',  
+                        {              
+                            '$ifNull': [
+                                '$post_id',
+                                '$id_video'
+                            ]
+                        }
                     ]
                 },
-                'engagements': {
-                    '$push': '$engagement'
-                }
+                'engagements': {'$push': '$engagement'}
             }
         }
     ]
+
     result = queryRefreshAggregate(aggregate)
     threshold = getThreshold(id_project)
     print("Treshhold ===== ", threshold)
+    if threshold is None or "threshold" not in threshold or not threshold["threshold"]:
+        print(f"[ERROR] Threshold data not found or empty for project ID: {id_project}. Aborting EWS logic.")
+        return
 
     urls = []
     deltas = []
@@ -192,8 +175,6 @@ def EWSLogic(refresh_id, id_project = None):
     timePosted = []
     timeRefreshed = []
     timeDelta = []
-    
-    # Asumsi GetKeywords adalah fungsi dari scrapper yang mengembalikan list
     keywords_list = GetKeywords(id_project)
     keywords = keywords_list["keywords"]
     keywords = {x: {"totalEngagements": 0, "totalDelta": 0} for x in keywords}
@@ -212,16 +193,11 @@ def EWSLogic(refresh_id, id_project = None):
     for item in result:
         unique_post_id = item["_id"]
         
-        # Cari di WatchList untuk detail publikasi
         watch_match = [x for x in watchListWithTimestamps if x.get("tweet_id") == unique_post_id or x.get("post_id") == unique_post_id or x.get("id_video") == unique_post_id]
-        
-        # Cari di data refresh terbaru (tweets) untuk menentukan platform
         latest_tweet_doc = next((t for t in tweets if t.get('tweet_id') == unique_post_id or t.get('post_id') == unique_post_id or t.get('id_video') == unique_post_id), None)
+        sentiment_value = latest_tweet_doc.get('sentiment', 'N/A') if latest_tweet_doc else 'N/A'
         platform = latest_tweet_doc.get('platform') if latest_tweet_doc else None
-        
-        # Menggunakan formTweetUrl yang fleksibel
         urls.append(formTweetUrl(unique_post_id, platform)) 
-        
         engagement.append(item["engagements"][-1])
         timeRefreshed.append(datetime.datetime.fromtimestamp(refresh_id))
 
@@ -241,7 +217,6 @@ def EWSLogic(refresh_id, id_project = None):
             timePosted.append(datetime.datetime.fromtimestamp(posted))
             timeDelta.append(timeDiffToString(refresh_id - posted))
         else:
-            # Fallback jika tidak ditemukan di WatchList (seharusnya tidak terjadi)
             timePosted.append(None)
             timeDelta.append(None)
 
@@ -278,6 +253,8 @@ def EWSLogic(refresh_id, id_project = None):
                 prevThres = thres
                 continue
         thres = prevThres
+        if thres is None:
+            thres = threshold["threshold"][-1]
 
         percent = delta / (before + 1) * 100
         percents.append(percent)
@@ -314,14 +291,10 @@ def EWSLogic(refresh_id, id_project = None):
                 }
     addReport(report)
 
-## 🌙 REDETERMINE WATCHLIST
-
 def redetermineWatchList(id_project = None):
     watchList = list(getActiveWatchList(id_project))
     for watch in watchList:
         dt = datetime.datetime.fromtimestamp(watch["timestamp_publikasi"])
-        
-        # ID unik dari WatchList
         watch_id = watch.get("tweet_id") or watch.get("post_id") or watch.get("id_video")
 
         if 20 <= dt.hour < 4:
