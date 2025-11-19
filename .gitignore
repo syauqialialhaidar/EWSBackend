@@ -1,5 +1,13 @@
+# Ignore environment file
 .env
+
+# Ignore zipped project files
 project.zip
+
+# Ignore log files
 run27.log
 run162.log
 run171.log
+
+# Ignore Python virtual environment
+venv/
