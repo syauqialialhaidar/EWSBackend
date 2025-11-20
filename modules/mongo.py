@@ -1,6 +1,15 @@
 import pymongo
-client = pymongo.MongoClient("localhost", 27018)
-db = client.ewsnew
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", 27017))
+TARGET_DB = os.getenv("TARGET_DB", "ewsnew")
+
+client = pymongo.MongoClient(DB_HOST, DB_PORT)
+db = client[TARGET_DB]
 
 def _create_id_filter(post_id, id_project=None):
     if not post_id:
